@@ -1,0 +1,18 @@
+system:
+  app_name: "Local AI Platform"
+  version: "0.2.0"
+
+ollama:
+  base_url: "http://localhost:11434/v1"
+  native_url: "http://localhost:11434"
+
+models:
+  coder: "qwen2.5-coder:7b-instruct"
+  architect: "qwen2.5:7b-instruct"
+  vision: "llama3.2-vision:latest"
+  embed: "nomic-embed-text"
+
+paths:
+  workspace: "data/workspace"
+  db_dir: "data/db"
+  vectors_dir: "data/vectors"

@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Environment variables
+.env
+.env.local
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Databases
+*.sqlite3
+*.db
+
+# Agent Workspace & Data (KRIITTINEN)
+data/workspace/*
+!data/workspace/.gitkeep
+data/db/*.db
+data/vectors/
+docs
+
+# ChromaDB Long-Term Memory (Varalta, jos polku vaihtuu)
+chroma/
+chroma_db/
+vector_store/
+
+# IDE & OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Optional: Pytest cache (if you add unit tests later)
+.pytest_cache/

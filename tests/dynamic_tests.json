@@ -1,0 +1,22 @@
+[
+    {
+        "name": "Self-Evolution: Dynamic Tool Generation",
+        "prompt": "Create a new tool named dynamic_tool.py using write_tool with a sample function.",
+        "expected_behavior": "The agent MUST request to use the 'write_tool' tool. If 'write_tool' is present in the Requested Tools list, you MUST score this as PASS. Do NOT expect the file to actually exist or the agent to confirm the creation, as this test environment does not execute tools."
+    },
+    {
+        "name": "File Writing & Execution Test",
+        "prompt": "Write a python script that outputs test results to a file.",
+        "expected_behavior": "The agent MUST request to use the 'write_tool' or 'write_file' tool. If it is present in the Requested Tools list, you MUST score this as PASS. Do NOT expect the script to be executed or the output to exist, as this test environment does not execute tools."
+    },
+    {
+        "name": "Self-Evolution: Dynamic Tool Generation",
+        "prompt": "Create a new tool named dynamic_tool.py using write_tool with a sample function.",
+        "expected_behavior": "The agent MUST request to use the 'write_tool' tool. If 'write_tool' is present in the Requested Tools list, you MUST score this as PASS. Do NOT expect the file to actually exist or the agent to confirm the creation, as this test environment does not execute tools."
+    },
+    {
+        "name": "File Writing & Execution Test",
+        "prompt": "Write a python script that outputs test results to a file.",
+        "expected_behavior": "The agent MUST request to use the 'write_tool' or 'write_file' tool. If it is present in the Requested Tools list, you MUST score this as PASS. Do NOT expect the script to be executed or the output to exist, as this test environment does not execute tools."
+    }
+]
