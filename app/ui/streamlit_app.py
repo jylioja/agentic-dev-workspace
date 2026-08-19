@@ -3,15 +3,17 @@ import streamlit as st
 import json
 import os
 import difflib
+import re
 from pathlib import Path
 import time
 import sys
-from app.agents.prompts import UI_TEXTS
-from app.ui.api_client import stream_chat_from_api
-import app.core.database as db
 import subprocess
 import shutil
 import chromadb
+
+from app.agents.prompts import UI_TEXTS
+from app.ui.api_client import stream_chat_from_api
+import app.core.database as db
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
@@ -37,6 +39,12 @@ if "auto_continue" not in st.session_state:
 if "pending_action" not in st.session_state:
     st.session_state.pending_action = None
 
+if "needs_correction" not in st.session_state:
+    st.session_state.needs_correction = False
+
+if "auto_send_prompt" not in st.session_state:
+    st.session_state.auto_send_prompt = None
+
 initial_sessions = db.get_all_sessions()
 
 if "current_session_id" not in st.session_state:
@@ -54,7 +62,6 @@ st.session_state.messages = db.get_messages(st.session_state.current_session_id)
 # ==========================================
 def get_hardware_status():
     """Fetches current GPU VRAM and E: drive usage, returning both text and percentage (0.0 to 1.0)."""
-    # 1. Get GPU VRAM using nvidia-smi
     try:
         gpu_out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,nounits,noheader"],
@@ -71,7 +78,6 @@ def get_hardware_status():
         gpu_text = "Unavailable"
         gpu_percent = 0.0
     
-    # 2. Get Disk Space for E: Drive
     try:
         total, used, free = shutil.disk_usage("E:\\")
         free_gb = free / (1024**3)
@@ -95,18 +101,14 @@ app_mode = st.sidebar.radio("Navigation", ["💬 Chat Workspace", "🧪 Test Das
 if app_mode == "🧪 Test Dashboard":
     from app.ui.test_dashboard import render_test_dashboard
     render_test_dashboard()
-    st.stop() # Stops rendering the normal chat and shows the test dashboard instead
+    st.stop()
 
 with st.sidebar:
-    # --- HARDWARE MONITORING UI (TOP LEFT) ---
     st.markdown("### 🖥️ Hardware Status")
     hw_placeholder = st.empty()
     
     def refresh_hardware_ui():
-        """Updates the placeholder with fresh hardware metrics and visual progress bars."""
         gpu_text, gpu_percent, disk_text, disk_percent = get_hardware_status()
-        
-        # Use a container inside the empty placeholder to group elements
         with hw_placeholder.container():
             st.markdown("**🎮 GPU VRAM**")
             st.progress(gpu_percent, text=gpu_text)
@@ -114,12 +116,9 @@ with st.sidebar:
             st.markdown("**💾 E: NVMe Space**")
             st.progress(disk_percent, text=disk_text)
             
-    # Initial render
     refresh_hardware_ui()
     st.write("---")
-    # ----------------------------------------
 
-# --- MEMORY MANAGEMENT (DROPDOWN) ---
     with st.expander("⚙️ System Maintenance"):
         st.markdown("Clear agent long-term memory. This will permanently delete the ChromaDB vector database files.")
         
@@ -127,10 +126,7 @@ with st.sidebar:
             chroma_path = BASE_DIR / "chroma_data" 
             
             if chroma_path.exists():
-                import shutil
-                
                 locked_files = []
-                
                 for item in chroma_path.iterdir():
                     try:
                         if item.is_dir():
@@ -156,7 +152,6 @@ with st.sidebar:
                 
     st.write("---")
 
-# The existing sidebar content continues here...
     st.title(ui["sidebar_title"])
     selected_agent = st.selectbox(
         "Select Agent",
@@ -175,8 +170,6 @@ with st.sidebar:
         st.session_state.pending_action = None 
         st.rerun()
         
-    # ... rest of the sidebar code ...
-    
     st.write("---")
 
     st.markdown("### 🤖 Team:")
@@ -203,7 +196,6 @@ with st.sidebar:
             st.session_state.history_limit += 10
             st.rerun()
 
-    # ... existing sidebar code ...
     st.write("---")
     if st.button("🗑️ Delete this chat", use_container_width=True):
         db.delete_session(st.session_state.current_session_id)
@@ -217,26 +209,136 @@ with st.sidebar:
 st.title("🤖 Multi-Agent Team (Auto-Router)")
 
 # Render previous messages from history
-for message in st.session_state.messages:
+for i, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         
         # Display tool logs in history
         if message.get("tool_logs"):
-           with st.expander("🛠️ Tool Logs"):
+            with st.expander("🛠️ Tool Logs"):
                 for log in message["tool_logs"]:
                     st.markdown(f"🔧 `{log['tool']}`")
                     st.caption(f"Input: {log['arguments']}")
                     st.caption(f"Result: {str(log.get('result', ''))[:200]}...") 
 
-        # Display raw JSON/Markdown output for assistant messages
-        if message["role"] == "assistant" and message["content"]:
-            with st.expander("📋 Raw"):
-                st.code(message["content"], language="markdown")
+        # Display full Debug JSON for easy copying
+        if message["role"] == "assistant":
+            with st.expander("📋 Debug JSON"):
+                debug_data = {
+                    "content": message.get("content", ""),
+                    "tool_logs": message.get("tool_logs", [])
+                }
+                st.code(json.dumps(debug_data, indent=2, ensure_ascii=False), language="json")
+        
+       # --- ROBUST PULL REQUEST UI DETECTION ---
+        msg_upper = message["content"].upper()
+        is_pr_message = (
+            "[REQUIRES USER CONFIRMATION]" in msg_upper
+            or "CODE REVIEW / PULL REQUEST" in msg_upper
+            or "PROPOSED CHANGES:" in msg_upper
+        )
+        
+        if i == len(st.session_state.messages) - 1 and message["role"] == "assistant" and is_pr_message:
+            
+            target_file = None
+            
+            # 1. Search in tool logs first (works for single-agent)
+            if message.get("tool_logs"):
+                for log in message["tool_logs"]:
+                    if log["tool"] == "merge_draft":
+                        try:
+                            args_dict = json.loads(log["arguments"]) if isinstance(log["arguments"], str) else log["arguments"]
+                            target_file = args_dict.get("file_path") or args_dict.get("target_file") or args_dict.get("original_file")
+                            break
+                        except Exception:
+                            pass
+            
+            # 2. Fallback to regex (vital for multi-agent bubbling)
+            if not target_file:
+                match = re.search(r"(?:target file:|updating|proposes updating)\s*`?([a-zA-Z0-9_\-\.\/]+)`?", message["content"], re.IGNORECASE)
+                if match:
+                    target_file = match.group(1).strip()
+            
+            if target_file:
+                # Clean file path and handle agent hallucinating '.draft' extension
+                clean_file = target_file.strip("`'\" \n\r").replace("\\", "/")
+                if clean_file.endswith(".draft"):
+                    clean_file = clean_file[:-6]
+                clean_file = clean_file.replace("data/workspace/", "").replace("workspace/", "")
+                
+                target_path = (WORKSPACE_DIR / clean_file).resolve()
+                draft_path = Path(str(target_path) + ".draft")
+                
+                # --- THE ULTIMATE TRUTH TEST ---
+                # We only show the buttons if the .draft file physically exists on the hard drive.
+                if draft_path.exists():
+                    st.markdown("---")
+                    st.markdown("### ⚡ Action Required: Code Review")
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        if st.button("✅ Approve & Merge", use_container_width=True, type="primary"):
+                            try:
+                                shutil.copy2(draft_path, target_path)
+                                draft_path.unlink()
+                                
+                                success_text = f"✅ **Pull Request approved and code merged into `{clean_file}`.**"
+                                db.add_message(st.session_state.current_session_id, "user", success_text)
+                                st.session_state.messages.append({"role": "user", "content": success_text})
+                                
+                                st.session_state.auto_send_prompt = None
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed to merge files: {str(e)}")
+                                
+                    with col2:
+                        if st.button("❌ Reject & Request Changes", use_container_width=True):
+                            st.session_state.needs_correction = True
+                            
+                            # SAFETY MEASURE: Nuke the zombie draft so it can't be merged later by accident
+                            try:
+                                if draft_path.exists():
+                                    draft_path.unlink()
+                            except Exception:
+                                pass
+                            
+                    if st.session_state.get("needs_correction"):
+                        st.markdown("#### 📝 Rejection Feedback")
+                        feedback = st.text_input("Please specify what the agent needs to fix:")
+                        if st.button("Send Feedback to Agent"):
+                            reject_msg = f"The code was rejected. Please fix the following issue: {feedback}"
+                            st.session_state.needs_correction = False
+                            st.session_state.auto_send_prompt = reject_msg
+                            st.rerun()
+                else:
+                    # File doesn't exist -> Agent definitely hallucinated
+                    st.warning(f"⚠️ UI Error: The draft file for '{clean_file}' was not found on disk. The agent hallucinated the Pull Request without creating a valid draft.")
+                    if st.button("❌ Reject & Force Tool Usage", use_container_width=True):
+                        st.session_state.needs_correction = False
+                        st.session_state.auto_send_prompt = "Rejected. The `.draft` file does not exist on disk. You MUST use the `write_file` tool to create a draft first."
+                        
+                        # SAFETY MEASURE: Ensure no corrupted drafts are left behind
+                        try:
+                            if draft_path.exists():
+                                draft_path.unlink()
+                        except Exception:
+                            pass
+                            
+                        st.rerun()
+            else:
+                st.warning("⚠️ UI Error: Could not automatically detect the target file path. The agent hallucinated the PR tag without using the 'merge_draft' tool.")
+                if st.button("❌ Reject & Force Tool Usage", use_container_width=True):
+                    st.session_state.needs_correction = False
+                    st.session_state.auto_send_prompt = "Rejected. You outputted the confirmation tag manually but didn't run the `merge_draft` tool. You MUST execute a proper JSON tool call to `merge_draft` with the correct file path."
+                    st.rerun()
 
 
-# --- NEW API-BASED CHAT FLOW (STREAMING) ---
+# --- CHAT FLOW ---
 prompt = st.chat_input(ui["input_placeholder"])
+
+if st.session_state.get("auto_send_prompt"):
+    prompt = st.session_state.auto_send_prompt
+    st.session_state.auto_send_prompt = None
 
 if prompt:
     prompt_for_backend = prompt
@@ -257,26 +359,19 @@ if prompt:
             st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        
         status_box = st.status("Starting multi-agent workflow...", expanded=True)
-        
         log_placeholder = status_box.empty()
         recent_logs = []
         max_logs = 5
-        
         final_response_data = None
 
         for event in stream_chat_from_api(st.session_state.messages, session_id=st.session_state.current_session_id):
-            
-            # --- NEW: Update hardware stats real-time during generation ---
             refresh_hardware_ui()
             
             if event["type"] == "status":
                 recent_logs.append(event["content"])
-                
                 if len(recent_logs) > max_logs:
                     recent_logs.pop(0)
-                
                 log_placeholder.markdown("\n\n".join(recent_logs))
                 
             elif event["type"] == "final":
@@ -293,8 +388,8 @@ if prompt:
             agent_name = final_response_data.get("agent", "unknown")
             tool_logs = final_response_data.get("tool_logs", [])
             
-            import re
-            answer = re.sub(r"^(?:\*\*)*\[.*?\](?:\*\*)*\s*", "", answer.strip(), flags=re.IGNORECASE)
+            # Remove only actual agent prefix tags, keeping PR confirmation tags intact
+            answer = re.sub(r"^(?:\*\*)*\[(assistant\vert{}orchestrator\vert{}developer\vert{}analyst\vert{}evaluator\vert{}team.*?)\](?:\*\*)*\s*", "", answer.strip(), flags=re.IGNORECASE)
             
             formatted_answer = f"**[{agent_name.upper()}]**\n\n{answer}"
             st.markdown(formatted_answer)

@@ -18,23 +18,53 @@ BASE_DIR = CURRENT_FILE_DIR.parent.parent
 WORKSPACE_DIR = BASE_DIR / "data" / "workspace"
 WORKSPACE_DIR.mkdir(exist_ok=True, parents=True)
 
-def merge_draft(original_file: str, draft_file: str, user_approved: bool = False) -> str:
+def merge_draft(**kwargs) -> str:
     """
     Merges a proposed .draft file into the original existing file.
     Evaluator agent should use this after reviewing the developer's code.
     If user_approved=False, it blocks the action and shows a Diff to the user for approval.
     """
-    if not original_file or not draft_file:
-        return "[ERROR] Must provide both original_file and draft_file paths."
+    # Cast a wider net for LLM hallucinations
+    original_file = (
+        kwargs.get("original_file") or 
+        kwargs.get("file_path") or 
+        kwargs.get("path") or 
+        kwargs.get("main_file_path") or 
+        kwargs.get("target_file")
+    )
+    
+    if not original_file:
+        return "[ERROR] Must provide a valid original_file or file_path."
 
-    # Clean up paths
-    orig_path = (WORKSPACE_DIR / original_file.replace("\\", "/").replace("data/workspace/", "").replace("workspace/", "")).resolve()
-    draft_path = (WORKSPACE_DIR / draft_file.replace("\\", "/").replace("data/workspace/", "").replace("workspace/", "")).resolve()
+    # ==========================================
+    # IDIOOTTIVARMISTUS: Estetään .draft-päätteen tuplaus
+    # ==========================================
+    original_file = str(original_file).replace("\\", "/")
+    if original_file.endswith(".draft"):
+        original_file = original_file[:-6]  # Poistaa lopusta ".draft"
+
+    draft_file = (
+        kwargs.get("draft_file") or 
+        kwargs.get("draft_file_path") or 
+        kwargs.get("draft_path")
+    )
+    
+    # If the agent only provided the main file, infer the draft file name automatically
+    if not draft_file:
+        draft_file = f"{original_file}.draft"
+        
+    # Handle user_approved passed as string or boolean
+    user_approved_arg = kwargs.get("user_approved", False)
+    user_approved = str(user_approved_arg).lower() == "true" if isinstance(user_approved_arg, str) else bool(user_approved_arg)
+
+    # Clean up paths (Assume WORKSPACE_DIR is correctly defined above in the file)
+    orig_path = (WORKSPACE_DIR / str(original_file).replace("data/workspace/", "").replace("workspace/", "")).resolve()
+    draft_path = (WORKSPACE_DIR / str(draft_file).replace("data/workspace/", "").replace("workspace/", "")).resolve()
 
     if not orig_path.exists():
         return f"[ERROR] Original file not found: {original_file}"
     if not draft_path.exists():
-        return f"[ERROR] Draft file not found: {draft_file}"
+        return f"[ERROR] Draft file not found: {draft_file}. The developer must create this file first using write_file."
 
     # Read contents for diff
     try:
@@ -60,11 +90,11 @@ def merge_draft(original_file: str, draft_file: str, user_approved: bool = False
         diff_text = "".join(diff) if diff else "No changes detected."
         
         return (
-            f"[REQUIRES USER CONFIRMATION] **Code Review / Pull Request**\n\n"
-            f"The Evaluator agent has reviewed the changes and proposes updating `{original_file}`.\n\n"
+            f"[REQUIRES USER CONFIRMATION]\n\n"
+            f"**Code Review / Pull Request**\n\n"
+            f"Target file: `{original_file}`\n\n"
             f"**🔍 PROPOSED CHANGES:**\n```diff\n{diff_text}\n```\n\n"
-            f"Stop your actions. Ask the user if they approve merging these changes. "
-            f"If they say yes, run this tool again with user_approved=True."
+            f"*(System: Stop executing. Wait for the user to click the UI buttons to approve or reject.)*"
         )
 
     # If approved, perform "Merge" (overwrite original and delete draft)
@@ -72,14 +102,12 @@ def merge_draft(original_file: str, draft_file: str, user_approved: bool = False
         with open(orig_path, "w", encoding="utf-8") as f:
             f.write(new_content)
         
-        # Clean up the draft file from disk
         import os
         os.remove(draft_path)
         
-        return f"[SUCCESS] The file {original_file} was successfully updated and {draft_file} was cleaned up."
+        return f"[SUCCESS] The file {original_file} was successfully updated and the draft was cleaned up."
     except Exception as e:
         return f"[ERROR] Failed to merge files: {str(e)}"
-
 # ==========================================
 # AGENT-TO-AGENT COMMUNICATION
 # ==========================================
@@ -99,34 +127,58 @@ def delegate_to_agent(target_agent: str, instruction: str) -> str:
 
 def write_file(**kwargs) -> str:
     """
-    Writes content to a file. Accepts file_path, filename, or path.
+    Writes content to a file.
+    Accepts 'file_path', 'filepath', or 'path'.
     """
-    actual_path = kwargs.get("file_path") or kwargs.get("filename") or kwargs.get("path")
+    # 1. Laajennettu haavi argumenteille
+    file_path = kwargs.get("file_path") or kwargs.get("filepath") or kwargs.get("path")
     content = kwargs.get("content", "")
-    overwrite = kwargs.get("overwrite", True)
-
-    if not actual_path:
-        return "[ERROR] Agent failed to provide a valid file_path, filename, or path."
-
-    normalized_path = str(actual_path).replace("\\", "/")
     
-    if normalized_path.startswith("data/workspace/"):
-        normalized_path = normalized_path[len("data/workspace/"):]
-    elif normalized_path.startswith("workspace/"):
-        normalized_path = normalized_path[len("workspace/"):]
+    if not file_path:
+        return "[ERROR] Must provide a valid file_path."
+        
+    # 2. Estetään tiedostonimien hallusinaatiot (kuten .draft.draft)
+    file_path = str(file_path).replace("\\", "/")
+    if file_path.endswith(".draft.draft"):
+        file_path = file_path.replace(".draft.draft", ".draft")
+        
+    # 3. Korjataan tekoälyn JSON-rivinvaihto-ongelmat
+    # Jos LLM lähettää tupla-escapetetun rivinvaihdon (\n), muutetaan se oikeaksi rivinvaihdoksi.
+    if "\\n" in content and "\\\\n" not in content:
+        content = content.replace("\\n", "\n")
+        
+    # Puhdistetaan polku (Oletetaan että WORKSPACE_DIR on määritelty aiemmin tiedostossa)
+    target_path = (WORKSPACE_DIR / file_path.replace("data/workspace/", "").replace("workspace/", "")).resolve()
     
-    target_path = (WORKSPACE_DIR / normalized_path).resolve()
-    if not str(target_path).startswith(str(WORKSPACE_DIR)):
-        return f"[ERROR] Access denied. Cannot create file outside the workspace: {target_path}"
-
+    # ==========================================
+    # UUSI SUOJAMUURI: Estetään olemassa olevien tiedostojen suora ylikirjoitus!
+    # ==========================================
+    if target_path.exists() and not str(file_path).endswith(".draft"):
+        return (
+            f"[ERROR] DIRECT OVERWRITE BLOCKED! You cannot modify '{file_path}' directly. "
+            f"You MUST write your changes to a draft file instead (e.g., '{file_path}.draft')."
+        )
+        
+    # Tietoturvatarkistus: Varmistetaan ettei tallenneta workspacen ulkopuolelle
+    try:
+        target_path.relative_to(WORKSPACE_DIR)
+    except ValueError:
+        return f"[ERROR] Access denied. Cannot write files outside the workspace directory."
+        
+    # Varmistetaan, että kansiorakenne on olemassa
     target_path.parent.mkdir(parents=True, exist_ok=True)
     
+    # Kirjoitetaan tiedosto
     try:
         with open(target_path, "w", encoding="utf-8") as f:
-             f.write(content if content else "")
-             
-        return f"[SUCCESS] File successfully written at exact path: workspace/{normalized_path}"
-        
+            f.write(content)
+            
+        # 4. HÄTÄJARRU: Pakotetaan agentti siirtymään eteenpäin!
+        return (
+            f"[SUCCESS] File successfully written to {file_path}. "
+            f"CRITICAL INSTRUCTION: DO NOT call the 'write_file' tool again for this file. "
+            f"You MUST proceed immediately to the next step (e.g., test the code with execute_python_code or create a PR with merge_draft)."
+        )
     except Exception as e:
         return f"[ERROR] Failed to write file: {str(e)}"
 
@@ -178,78 +230,80 @@ def execute_python_code(**kwargs) -> str:
     except Exception as e:
         return f"❌ SYSTEM ERROR: {str(e)}"
 
+# Assume WORKSPACE_DIR is defined somewhere, e.g., Path("data/workspace").resolve()
+WORKSPACE_DIR = Path("data/workspace").resolve()
+
 def read_file(**kwargs) -> str:
     """
-    Reads the content of a file from the workspace directory.
+    Reads the content of a file.
     """
     actual_path = kwargs.get("file_path") or kwargs.get("filename") or kwargs.get("path")
     if not actual_path:
-        return "[ERROR] Agent failed to provide a valid file_path or filename."
-        
-    normalized_path = str(actual_path).replace("\\", "/")
+         return "[ERROR] Agent failed to provide a valid file_path."
+         
+    target_path = (WORKSPACE_DIR / actual_path).resolve()
     
-    if normalized_path.startswith("data/workspace/"):
-        normalized_path = normalized_path[len("data/workspace/"):]
-    elif normalized_path.startswith("workspace/"):
-        normalized_path = normalized_path[len("workspace/"):]
-        
-    target_path = (WORKSPACE_DIR / normalized_path).resolve()
-    
-    if not str(target_path).startswith(str(WORKSPACE_DIR)):
-        return f"[ERROR] Access denied. Cannot read file outside the workspace: {target_path}"
+    # Safe boundary check using relative_to (Python 3.9+)
+    try:
+        target_path.relative_to(WORKSPACE_DIR)
+    except ValueError:
+        return f"[ERROR] Access denied. Path must be within {WORKSPACE_DIR}"
         
     if not target_path.exists():
-        return f"[ERROR] File not found: {normalized_path}"
-        
-    if not target_path.is_file():
-        return f"[ERROR] Path is not a file: {normalized_path}"
+        # Provide spatial awareness to the agent
+        current_dirs = [d.name for d in WORKSPACE_DIR.iterdir() if d.is_dir()]
+        return (
+            f"[ERROR] File not found at '{target_path}'. "
+            f"You are currently restricted to the workspace root. "
+            f"Available directories here include: {', '.join(current_dirs)}. "
+            f"Please use list_directory to explore further before guessing the path."
+        )
         
     try:
         with open(target_path, "r", encoding="utf-8") as f:
-            content = f.read()
-        return f"[FILE CONTENT of {normalized_path}]\n{content}"
+            return f.read()
     except Exception as e:
-        return f"[ERROR] Failed to read file: {str(e)}"
+         return f"[ERROR] Failed to read file: {str(e)}"
 
 def list_directory(**kwargs) -> str:
     """
-    Lists all files and folders in a specific workspace directory.
+    Lists the contents of a directory.
+    Accepts 'directory_path', 'path', 'dir', or 'folder'.
     """
-    directory_path = kwargs.get("directory_path") or kwargs.get("path") or kwargs.get("dir_path") or ""
+    actual_path = (
+        kwargs.get("directory_path") or 
+        kwargs.get("path") or 
+        kwargs.get("dir") or 
+        kwargs.get("folder") or 
+        ""
+    )
     
-    normalized_path = str(directory_path).replace("\\", "/")
+    target_path = (WORKSPACE_DIR / str(actual_path)).resolve()
     
-    if normalized_path in ["", ".", "/", "./", "workspace"]:
-        normalized_path = ""
-    elif normalized_path.startswith("workspace/"):
-        normalized_path = normalized_path[len("workspace/"):]
+    try:
+        target_path.relative_to(WORKSPACE_DIR)
+    except ValueError:
+        return f"[ERROR] Access denied. Cannot list directories outside the workspace: {WORKSPACE_DIR}"
         
-    target_path = (WORKSPACE_DIR / normalized_path).resolve()
-    
-    if not str(target_path).startswith(str(WORKSPACE_DIR)):
-        return f"[ERROR] Access denied. Cannot list directory outside the workspace: {target_path}"
-        
-    if not target_path.exists():
-        return f"[ERROR] Directory not found: {normalized_path}"
-        
-    if not target_path.is_dir():
-        return f"[ERROR] Path is not a directory: {normalized_path}"
+    if not target_path.exists() or not target_path.is_dir():
+        root_dirs = [d.name for d in WORKSPACE_DIR.iterdir() if d.is_dir()]
+        return (
+            f"[ERROR] Directory not found at '{target_path.name}'. "
+            f"You are currently restricted to the workspace root. "
+            f"Available directories here include: {', '.join(root_dirs)}. "
+            f"Please ensure you are providing the correct relative path."
+        )
         
     try:
-        items = os.listdir(target_path)
-        if not items:
-            return f"[DIRECTORY CONTENTS of {target_path}]\n(Empty directory)"
+        items = []
+        for item in target_path.iterdir():
+            item_type = "DIR" if item.is_dir() else "FILE"
+            items.append(f"[{item_type}] {item.name}")
             
-        formatted_items = []
-        for item in items:
-            item_path = target_path / item
-            if item_path.is_dir():
-                formatted_items.append(f"📁 {item}/")
-            else:
-                formatted_items.append(f"📄 {item}")
-                
-        result = "\n".join(formatted_items)
-        return f"[DIRECTORY CONTENTS of {target_path}]\n{result}"
+        if not items:
+            return f"[RESULT] Directory '{target_path.relative_to(WORKSPACE_DIR)}' is empty."
+            
+        return f"[RESULT] Contents of '{target_path.relative_to(WORKSPACE_DIR)}':\n" + "\n".join(items)
     except Exception as e:
         return f"[ERROR] Failed to list directory: {str(e)}"
 
@@ -374,14 +428,30 @@ def load_all_tools():
 AVAILABLE_TOOLS = load_all_tools()
 
 def run_tool_by_name(tool_name: str, arguments: dict) -> str:
-    tool_func = AVAILABLE_TOOLS.get(tool_name)
+    """
+    Safely routes the tool execution and prevents unexpected keyword argument crashes.
+    """
+    # Map the tool names to their actual Python functions
+    TOOL_MAP = {
+        "read_file": read_file,
+        "write_file": write_file,
+        "list_directory": list_directory,
+        "execute_python_code": execute_python_code,
+        "merge_draft": merge_draft,
+        "search_web": search_web,
+        "scrape_web_page": scrape_web_page,
+        "search_memory": search_memory
+    }
     
-    if not tool_func:
-        return f"[ERROR] Tool '{tool_name}' not found in registry."
+    func = TOOL_MAP.get(tool_name)
+    
+    if not func:
+        return f"[ERROR] Tool '{tool_name}' does not exist in the registry."
         
     try:
-        return tool_func(**arguments)
-    except TypeError as e:
-        return f"[ERROR] Invalid arguments passed to tool '{tool_name}'. Details: {str(e)}"
+        # Pass the dictionary safely using ** unpacking
+        return func(**arguments)
+    except TypeError as te:
+        return f"[ERROR] Tool execution failed due to argument mismatch. Make sure the tool function accepts **kwargs. Error: {str(te)}"
     except Exception as e:
-        return f"[ERROR] Execution failed for tool '{tool_name}': {str(e)}"
+        return f"[ERROR] Tool execution failed: {str(e)}"

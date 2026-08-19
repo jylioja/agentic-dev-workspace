@@ -12,9 +12,9 @@ OLLAMA_CLIENT = OpenAI(
 
 ALLOWED_TOOLS = {
     "developer": ["read_file", "list_directory", "write_file", "write_tool", "execute_python_code", "delegate_to_agent", "search_web", "scrape_web_page", "merge_draft"],
-    "evaluator": ["delegate_to_agent"],
-    "orchestrator": ["search_memory", "delegate_to_agent", "search_web", "scrape_web_page", "task_complete"],
-    "assistant": ["search_web", "scrape_web_page", "delegate_to_agent", "task_complete"],
+    "evaluator": ["delegate_to_agent", "merge_draft"],
+    "orchestrator": ["search_memory", "delegate_to_agent", "search_web", "scrape_web_page", "task_complete", "merge_draft"],
+    "assistant": ["search_web", "scrape_web_page", "delegate_to_agent", "task_complete", "merge_draft"],
     "analyst": ["read_file", "list_directory", "search_memory", "execute_python_code", "delegate_to_agent"]
 }
 
@@ -44,9 +44,9 @@ def get_best_agent(messages: list[dict]) -> str:
         if selected_agent not in ALLOWED_TOOLS:
             return "assistant"
         return selected_agent
-        except Exception as e:
-            print(f"Router error: {e}")
-            return "assistant"
+    except Exception as e:
+        print(f"Router error: {e}")
+        return "assistant"
 
 def get_agent_response(
     agent_key: str,
@@ -145,7 +145,7 @@ def get_agent_response(
         return f"❌ **Error:** {str(e)}", []
 
 
-def _run_delegation_loop(target_internal_key: str, instruction: str, source_agent: str, max_steps: int = 15, status_callback=None) -> str:
+def _run_delegation_loop(target_internal_key: str, instruction: str, source_agent: str, max_steps: int = 15, status_callback=None, caller_chain=None) -> str:
     print(f"🔄 Starting internal delegation: {source_agent} -> {target_internal_key}")
     
     if status_callback:
@@ -174,25 +174,17 @@ def _run_delegation_loop(target_internal_key: str, instruction: str, source_agen
             tool_names = ", ".join([t.get("name", "unknown") for t in t_calls])
             status_callback(f"⚙️ **{target_internal_key.capitalize()}** is calling tools: {tool_names}")
             
-        tool_logs = execute_pending_tools(t_calls, status_callback=status_callback)
+        # Pass the caller_chain down to the next tool execution
+        tool_logs = execute_pending_tools(t_calls, status_callback=status_callback, caller_chain=caller_chain)
         
         for log in tool_logs:
             result_str = str(log.get("result", ""))
             
-            if "[ERROR] Permission denied" in result_str:
-                print(f"⚠️ Circuit breaker triggered: Agent '{target_internal_key}' attempted unauthorized tool '{log['tool']}'")
-                return f"❌ **Critical Error:** Agent '{target_internal_key}' tried to use an unauthorized tool ('{log['tool']}'). Delegation aborted."
-            
-            if "[REQUIRES USER CONFIRMATION]" in result_str or "⚠️ **Action Paused" in result_str:
+            # BUBBLE UP CRITICAL ERRORS AND PAUSES IMMEDIATELY
+            if "⚠️" in result_str or "🛑" in result_str or "[REQUIRES USER CONFIRMATION]" in result_str or "[ERROR] Permission denied" in result_str:
                 if status_callback:
-                    status_callback("🛑 Task paused, waiting for user input.")
-                    
-                if "[REQUIRES USER CONFIRMATION]" in result_str:
-                    clean_message = result_str.replace("[REQUIRES USER CONFIRMATION]", "").strip()
-                    agent_name_display = target_internal_key.capitalize()
-                    return f"⚠️ **Action Paused ({agent_name_display}):**\n\n{clean_message}"
-                else:
-                    return result_str
+                    status_callback("🛑 Task execution halted by circuit breaker.")
+                return result_str # Immediately break this agent's loop and bubble the error up!
         
         import json
         logs_str = json.dumps(tool_logs, indent=2, ensure_ascii=False)
@@ -204,9 +196,12 @@ def _run_delegation_loop(target_internal_key: str, instruction: str, source_agen
     return f"[DELEGATION RESULT from {target_internal_key}]\nMaximum steps reached ({max_steps}). Last message:\n{ans_text}"
 
 
-def execute_pending_tools(tool_calls: list[dict], status_callback=None) -> list[dict]:
+def execute_pending_tools(tool_calls: list[dict], status_callback=None, caller_chain=None) -> list[dict]:
     print(f"DEBUG: execute_pending_tools started, tools count: {len(tool_calls)}")
     tool_logs = []
+    
+    if caller_chain is None:
+        caller_chain = []
     
     AGENT_NAME_MAP = {
         "Developer": "developer",
@@ -252,10 +247,17 @@ def execute_pending_tools(tool_calls: list[dict], status_callback=None) -> list[
             target_ui_name = func_args.get("target_agent", "")
             instruction = func_args.get("instruction", "")
             target_internal_key = AGENT_NAME_MAP.get(target_ui_name, "evaluator")
-            try:
-                tool_result = _run_delegation_loop(target_internal_key, instruction, agent_key, status_callback=status_callback)
-            except Exception as e:
-                tool_result = f"[ERROR] {str(e)}"
+            
+            # 🛑 CIRCUIT BREAKER: Prevent infinite ping-pong loops
+            new_chain = caller_chain + [agent_key]
+            if target_internal_key in new_chain:
+                tool_result = f"[REQUIRES USER CONFIRMATION] 🛑 Delegation loop detected ({' -> '.join(new_chain)} -> {target_internal_key}). The agents are stuck and cannot resolve this. Please intervene."
+                print(f"⚠️ Ping-Pong loop detected and stopped: {new_chain} -> {target_internal_key}")
+            else:
+                try:
+                    tool_result = _run_delegation_loop(target_internal_key, instruction, agent_key, status_callback=status_callback, caller_chain=new_chain)
+                except Exception as e:
+                    tool_result = f"[ERROR] {str(e)}"
         else:
             from app.tools.registry import run_tool_by_name
             tool_result = run_tool_by_name(func_name, func_args)
